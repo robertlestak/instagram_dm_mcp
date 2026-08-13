@@ -1,9 +1,11 @@
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware
 from instagrapi import Client
 from instagrapi.exceptions import BadPassword, ChallengeRequired, TwoFactorRequired
 import argparse
+import ipaddress
 import sys
 from typing import Optional, List, Dict, Any
 import json
@@ -103,6 +105,61 @@ mcp = FastMCP(
 )
 
 UNRECOVERABLE_LOGIN_ERRORS = (TwoFactorRequired, BadPassword, ChallengeRequired)
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether a bind address is reachable only from this machine."""
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def configure_caller_auth(transport: str, host: str) -> None:
+    """Require a bearer token before exposing this server beyond loopback.
+
+    MCP has no caller authentication of its own, and this server holds a live
+    Instagram session — so anything that can reach the port can read every DM
+    and send messages as the account, without needing any Instagram credential.
+    A bind to 0.0.0.0 (the container default) plus an ingress route is enough to
+    put that on the public internet.
+
+    So a non-loopback bind without MCP_AUTH_TOKEN is refused rather than served.
+    Failing closed is the only safe default here: the cost of a false stop is a
+    puzzled operator, and the cost of a false start is a stranger with the
+    account.
+    """
+    if transport == "stdio":
+        return  # No listener; the parent process is the only caller.
+
+    token = (os.getenv("MCP_AUTH_TOKEN") or "").strip()
+    if token:
+        mcp.auth = StaticTokenVerifier(
+            tokens={token: {"client_id": "instagram-dm-mcp", "scopes": []}}
+        )
+        logger.info("Caller authentication enabled; requests need a bearer token.")
+        return
+
+    if _is_loopback(host):
+        logger.warning(
+            "No MCP_AUTH_TOKEN set. Serving unauthenticated on %s, which is reachable "
+            "only from this machine. Set one before binding anywhere else.", host
+        )
+        return
+
+    logger.error(
+        f"Refusing to serve on {host} without MCP_AUTH_TOKEN. This server can read and "
+        f"send DMs as the signed-in account, and nothing else would authenticate the "
+        f"caller. Set MCP_AUTH_TOKEN, or bind to 127.0.0.1 and put your own "
+        f"authenticated proxy in front."
+    )
+    print(
+        f"Error: refusing to serve on {host} without MCP_AUTH_TOKEN (see the readme)",
+        file=sys.stderr,
+    )
+    exit(1)
 
 
 def _record_block(err: BaseException) -> None:
@@ -1684,6 +1741,10 @@ if __name__ == "__main__":
     AUTH.sessionid = unquote(_raw_sessionid.strip().strip('"')) or None
     AUTH.session_dir = SESSION_DIR
     AUTH.session_file = SESSION_FILE
+
+    # Decided before any Instagram work, so an unsafe exposure is refused
+    # without first spending a login attempt on the account.
+    configure_caller_auth(args.transport, args.host)
 
     # Sign-in is attempted once here and never retried on a loop: if it cannot
     # complete, the server still starts and reports what it needs through the

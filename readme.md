@@ -167,6 +167,7 @@ Every flag has an environment-variable equivalent.
 | `--host` | `MCP_HOST` | `127.0.0.1` | HTTP transports only |
 | `--port` | `MCP_PORT` | `8000` | HTTP transports only |
 | `--path` | `MCP_PATH` | `/mcp` (`/sse` for sse) | Endpoint mount path |
+| — | `MCP_AUTH_TOKEN` | unset | Bearer token callers must present. **Required** for any non-loopback bind |
 
 Run it over HTTP:
 
@@ -191,9 +192,33 @@ Then point a client at the URL instead of spawning a subprocess:
 Redirect`. Clients that don't follow redirects on POST report that as a connection
 failure, so use the exact path.
 
-Note that the server holds one authenticated Instagram session, so an HTTP listener
-exposes that account to anything that can reach the port. Keep it bound to `127.0.0.1`
-unless you have put your own authentication in front of it.
+### Authenticating callers
+
+MCP has no caller authentication of its own, and this server holds a live Instagram
+session — so anything that can reach the port can read every DM and send messages as the
+account, with no Instagram credential of its own. A bind to `0.0.0.0` plus an ingress
+route is enough to put that on the public internet.
+
+So the server **refuses to start on a non-loopback address without `MCP_AUTH_TOKEN`**:
+
+```bash
+MCP_AUTH_TOKEN=$(openssl rand -hex 32) python src/mcp_server.py \
+  --transport streamable-http --host 0.0.0.0
+```
+
+Callers then send `Authorization: Bearer <token>`; anything else gets a 401. Binding to
+`127.0.0.1` without a token still works for local use, with a warning.
+
+```json
+{
+  "mcpServers": {
+    "instagram_dms": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer <your token>" }
+    }
+  }
+}
+```
 
 ---
 
@@ -222,15 +247,16 @@ docker run -it --rm -v ig-mcp-data:/data instagram-dm-mcp auth.py
 ```bash
 docker run -d --name instagram-dm-mcp \
   -p 127.0.0.1:8000:8000 \
+  -e MCP_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v ig-mcp-data:/data \
   instagram-dm-mcp
 ```
 
 Point your client at `http://127.0.0.1:8000/mcp` (see the trailing-slash note above).
 
-Publishing as `-p 127.0.0.1:8000:8000` rather than `-p 8000:8000` keeps the port on the
-loopback interface. A bare `-p 8000:8000` exposes your authenticated Instagram account to
-your whole network — the server itself has no authentication.
+The image binds `0.0.0.0` inside the container, so **`MCP_AUTH_TOKEN` is required** — the
+container exits at startup without one. Publishing as `-p 127.0.0.1:8000:8000` rather than
+`-p 8000:8000` additionally keeps the port off your network.
 
 Transport settings are read from the environment, so they can be overridden per run:
 
