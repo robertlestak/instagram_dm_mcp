@@ -344,6 +344,7 @@ Below is a list of all available tools and what they do:
 | `instagram_auth_status`     | Report whether the server is signed in, and what it needs if not. Always available.            |
 | `instagram_login`           | Sign in, optionally completing 2FA with a code the user reads off their phone. Always available. |
 | `send_message`              | Send an Instagram direct message to a user by username.                                       |
+| `reply_to_message`          | Send a quote reply to a specific message in a thread, rendered with the original quoted above it. |
 | `send_photo_message`        | Send a photo as an Instagram direct message to a user by username.                            |
 | `send_video_message`        | Send a video as an Instagram direct message to a user by username.                            |
 | `list_chats`                | Get Instagram Direct Message threads (chats) from your account, with optional filters/limits.  |
@@ -352,6 +353,8 @@ Below is a list of all available tools and what they do:
 | `download_shared_post_from_message` | Download media from a shared post, reel, or clip in a DM message (not for direct uploads). |
 | `list_media_messages`       | List all messages containing direct-uploaded media (photo/video) in a DM thread.              |
 | `mark_message_seen`         | Mark a specific message in an Instagram Direct Message thread as seen.                         |
+| `react_to_message`          | React to a message with an emoji (defaults to the heart, i.e. Instagram's double-tap like).    |
+| `remove_message_reaction`   | Remove your own emoji reaction from a message.                                                 |
 | `delete_message`            | Delete a message from a direct message thread.                                                 |
 | `mute_conversation`         | Mute or unmute a direct message conversation.                                                  |
 | `hide_chat`                 | Remove a chat from your inbox (Instagram's "Delete"), optionally filing it under hidden requests. |

@@ -557,6 +557,45 @@ def send_message(username: str, message: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @rate_limited("dm_send")
+def reply_to_message(thread_id: str, message_id: str, message: str) -> Dict[str, Any]:
+    """Send a quote reply to a specific message in an Instagram Direct Message thread.
+
+    The reply renders in Instagram with the original message quoted above it, the same
+    way a swipe-to-reply does in the app. Use list_chats to find the thread_id and
+    list_messages to find the message_id you want to reply to.
+
+    Args:
+        thread_id: The thread ID containing the message being replied to.
+        message_id: The ID of the message to quote.
+        message: The reply text to send.
+    Returns:
+        A dictionary with success status and a status message.
+    """
+    if not thread_id or not message_id or not message:
+        return {"success": False, "message": "thread_id, message_id and message must all be provided."}
+    try:
+        target = _find_message_in_thread(thread_id, message_id)
+        if not target:
+            return {
+                "success": False,
+                "message": f"Message '{message_id}' not found in the last 100 messages of thread '{thread_id}'.",
+            }
+        dm = client.direct_send(message, thread_ids=[int(thread_id)], reply_to_message=target)
+        if dm:
+            return {
+                "success": True,
+                "message": "Reply sent.",
+                "direct_message_id": getattr(dm, 'id', None),
+                "replied_to_message_id": message_id,
+            }
+        else:
+            return {"success": False, "message": "Failed to send reply."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@mcp.tool()
+@rate_limited("dm_send")
 def send_photo_message(username: str, photo_path: str) -> Dict[str, Any]:
     """Send a photo via Instagram direct message to a user by username.
 
@@ -739,6 +778,89 @@ def mark_message_seen(thread_id: str, message_id: str) -> Dict[str, Any]:
             return {"success": True, "message": "Message marked as seen."}
         else:
             return {"success": False, "message": "Failed to mark message as seen."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def _reaction_context(thread_id: str, message_id: str) -> Dict[str, Any]:
+    """Resolve the extra fields Instagram wants when reacting to a message.
+
+    Reactions are accepted without these, but voice notes and disappearing media need
+    target_item_type to attach correctly, so look the message up when we can and fall
+    back to a bare reaction when we can't find it.
+    """
+    target = _find_message_in_thread(thread_id, message_id)
+    if not target:
+        return {}
+    context: Dict[str, Any] = {"client_context": getattr(target, 'client_context', None)}
+    item_type = getattr(target, 'item_type', None)
+    if item_type in ("raven_media", "voice_media"):
+        context["target_item_type"] = item_type
+    return context
+
+
+@mcp.tool()
+@rate_limited("like")
+def react_to_message(thread_id: str, message_id: str, emoji: str = "❤") -> Dict[str, Any]:
+    """React to a message in an Instagram Direct Message thread with an emoji.
+
+    Defaults to the heart reaction, which is what Instagram's double-tap "like" sends.
+
+    Args:
+        thread_id: The thread ID containing the message.
+        message_id: The ID of the message to react to.
+        emoji: The emoji to react with (default heart).
+    Returns:
+        A dictionary with success status and a status message.
+    """
+    if not thread_id or not message_id:
+        return {"success": False, "message": "Both thread_id and message_id must be provided."}
+    if not emoji:
+        return {"success": False, "message": "Emoji must be provided."}
+    try:
+        result = client.direct_send_reaction(
+            int(thread_id),
+            int(message_id),
+            emoji=emoji,
+            **_reaction_context(thread_id, message_id),
+        )
+        if result:
+            return {"success": True, "message": f"Reacted with {emoji}."}
+        else:
+            return {"success": False, "message": "Failed to react to message."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@mcp.tool()
+@rate_limited("like")
+def remove_message_reaction(thread_id: str, message_id: str, emoji: str = "❤") -> Dict[str, Any]:
+    """Remove your own emoji reaction from a message in an Instagram Direct Message thread.
+
+    The emoji must match the reaction you sent; it defaults to the heart reaction.
+
+    Args:
+        thread_id: The thread ID containing the message.
+        message_id: The ID of the message to remove your reaction from.
+        emoji: The emoji reaction to remove (default heart).
+    Returns:
+        A dictionary with success status and a status message.
+    """
+    if not thread_id or not message_id:
+        return {"success": False, "message": "Both thread_id and message_id must be provided."}
+    if not emoji:
+        return {"success": False, "message": "Emoji must be provided."}
+    try:
+        result = client.direct_delete_reaction(
+            int(thread_id),
+            int(message_id),
+            emoji=emoji,
+            **_reaction_context(thread_id, message_id),
+        )
+        if result:
+            return {"success": True, "message": f"Removed {emoji} reaction."}
+        else:
+            return {"success": False, "message": "Failed to remove reaction."}
     except Exception as e:
         return {"success": False, "message": str(e)}
 
