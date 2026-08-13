@@ -1,8 +1,15 @@
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from instagrapi import Client
+from instagrapi.exceptions import BadPassword, ChallengeRequired, TwoFactorRequired
 import argparse
 from typing import Optional, List, Dict, Any
+import json
 import os
+import re
+from datetime import datetime, timezone
+from urllib.parse import unquote
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
@@ -18,14 +25,482 @@ logger.setLevel(logging.DEBUG)
 
 INSTRUCTIONS = """
 This server is used to send messages to a user on Instagram.
+
+If a tool reports that the server is not signed in, call instagram_auth_status and do
+exactly what its next_step says. Do not assume a 2FA code is needed — the server often
+holds its own, and some accounts never get one. Never ask anyone to send you a password
+or a session cookie; those are configured on the server and must not pass through here.
 """
 
 client = Client()
 
+
+class AuthState:
+    """Where the Instagram session stands, as the running server sees it.
+
+    Sign-in is deliberately not a startup precondition. The server has to keep
+    serving when a session is missing or expired, because the alternative —
+    exiting — means a supervised container restarts and retries the login every
+    few minutes, and repeated failed logins are what get accounts banned. Here
+    the process stays up, reports what it needs, and waits to be given it.
+    """
+
+    def __init__(self) -> None:
+        self.authenticated: bool = False
+        # unconfigured | needs_login | needs_2fa | bad_totp_seed | blocked | authenticated
+        self.state: str = "unconfigured"
+        self.detail: str = "The server has not attempted a sign-in yet."
+        self.username: Optional[str] = None
+        self.password: Optional[str] = None
+        self.totp_seed: Optional[str] = None
+        # Credentials, all server-side only. None of these are ever accepted
+        # through a tool call — see _adopt_sessionid for why that matters.
+        self.sessionid: Optional[str] = None
+        # Set once Instagram has rejected a code minted from the seed, so the
+        # server stops offering "just try again" as the next step.
+        self.totp_rejected: bool = False
+        self.session_file: Optional[Path] = None
+        self.session_dir: Optional[Path] = None
+
+    @property
+    def block_file(self) -> Optional[Path]:
+        return self.session_dir / "login_blocked.json" if self.session_dir else None
+
+    def set(self, state: str, detail: str) -> None:
+        self.state = state
+        self.detail = detail
+        self.authenticated = state == "authenticated"
+
+
+AUTH = AuthState()
+
+# Tools that must stay reachable while signed out — they are how you sign in.
+AUTH_TOOLS = {"instagram_auth_status", "instagram_login"}
+
+
+class RequireAuth(Middleware):
+    """Fail Instagram tools with an actionable message when signed out.
+
+    Without this, every tool surfaces a different low-level instagrapi error
+    when the session is missing, and the agent has no way to know that the fix
+    is a sign-in rather than a retry.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        if context.message.name not in AUTH_TOOLS and not AUTH.authenticated:
+            raise ToolError(
+                f"Not signed in to Instagram ({AUTH.state}): {AUTH.detail} "
+                f"Call instagram_auth_status for the next step."
+            )
+        return await call_next(context)
+
+
 mcp = FastMCP(
    name="Instagram DMs",
-   instructions=INSTRUCTIONS
+   instructions=INSTRUCTIONS,
+   middleware=[RequireAuth()],
 )
+
+UNRECOVERABLE_LOGIN_ERRORS = (TwoFactorRequired, BadPassword, ChallengeRequired)
+
+
+def _record_block(err: BaseException) -> None:
+    """Remember a login failure that only a human can clear.
+
+    Read back on the next start so a restarting container does not re-attempt
+    the same doomed login on a loop.
+    """
+    if not AUTH.block_file:
+        return
+    try:
+        AUTH.block_file.write_text(json.dumps({
+            "username": AUTH.username,
+            "error": type(err).__name__,
+            "detail": str(err),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # What the server had to work with at the time. If it gains a way to
+            # produce a code later, the block no longer describes the situation.
+            "had_totp_seed": bool(AUTH.totp_seed),
+        }, indent=2))
+    except Exception:  # noqa: BLE001
+        logger.warning(f"Could not record the login block at {AUTH.block_file}")
+
+
+def _read_block() -> Optional[Dict[str, Any]]:
+    if not AUTH.block_file or not AUTH.block_file.exists():
+        return None
+    try:
+        return json.loads(AUTH.block_file.read_text())
+    except Exception:  # noqa: BLE001
+        return {"error": "unknown", "detail": "unreadable block file"}
+
+
+def _clear_block() -> None:
+    if not AUTH.block_file:
+        return
+    try:
+        AUTH.block_file.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not clear {AUTH.block_file}: {e}")
+
+
+def _save_session() -> None:
+    if AUTH.session_file:
+        client.dump_settings(AUTH.session_file)
+        logger.info(f"Session saved to {AUTH.session_file}")
+
+
+def _attempt_login(verification_code: str = "") -> Dict[str, Any]:
+    """Log in, and translate the outcome into AuthState plus a tool-shaped dict."""
+    if not AUTH.username or not AUTH.password:
+        AUTH.set("unconfigured", "No username/password configured on the server.")
+        return {"success": False, "state": AUTH.state, "message": AUTH.detail}
+
+    # A TOTP seed makes 2FA fully headless: the code is derived here rather
+    # than typed by a person, which is the only way an unattended restart can
+    # get through 2FA on its own.
+    used_generated_code = False
+    if not verification_code and AUTH.totp_seed:
+        try:
+            verification_code = client.totp_generate_code(AUTH.totp_seed)
+            used_generated_code = True
+            logger.info("Generated a 2FA code from INSTAGRAM_TOTP_SEED")
+        except Exception as e:  # noqa: BLE001
+            # Do not fall through to a code-less login: Instagram answers that
+            # with "2FA required", which reads as a rejected code and sends the
+            # caller hunting for a fresh one when the seed is the actual problem.
+            AUTH.set("bad_totp_seed", f"INSTAGRAM_TOTP_SEED is unusable: {e}")
+            logger.error(
+                f"Could not generate a code from INSTAGRAM_TOTP_SEED ({e}). Separators and "
+                f"case are already normalised, so the value itself is not a base32 secret "
+                f"(letters A-Z and digits 2-7). No login was attempted."
+            )
+            return {"success": False, "state": AUTH.state, "message": AUTH.detail}
+
+    try:
+        client.login(AUTH.username, AUTH.password, verification_code=verification_code)
+    except TwoFactorRequired as e:
+        _record_block(e)
+        if used_generated_code:
+            # The seed produced a well-formed code that Instagram rejected, so
+            # the seed is wrong for this account. Retrying regenerates the same
+            # wrong code — say so, or the caller loops.
+            AUTH.totp_rejected = True
+            AUTH.set(
+                "needs_2fa",
+                "Instagram rejected the code generated from INSTAGRAM_TOTP_SEED, so that "
+                "seed does not belong to this account's authenticator.",
+            )
+            return {
+                "success": False,
+                "state": AUTH.state,
+                "message": (
+                    "The code generated from INSTAGRAM_TOTP_SEED was rejected. Calling this "
+                    "again without a code will produce the same wrong code — the seed itself "
+                    "needs fixing on the server, or set INSTAGRAM_SESSIONID instead. A single "
+                    "code read from the user's authenticator can get in right now."
+                ),
+            }
+        AUTH.set("needs_2fa", "Instagram wants a 2FA code for this sign-in.")
+        return {
+            "success": False,
+            "state": AUTH.state,
+            "message": (
+                "Two-factor authentication required. Ask the user for the current "
+                "6-digit code and call instagram_login again with verification_code set. "
+                "Codes expire in about 30 seconds, so pass it promptly."
+            ),
+        }
+    except UNRECOVERABLE_LOGIN_ERRORS as e:
+        AUTH.set("blocked", f"{type(e).__name__}: {e}")
+        _record_block(e)
+        return {
+            "success": False,
+            "state": AUTH.state,
+            "message": (
+                f"Sign-in failed: {type(e).__name__}: {e}. This needs a person — check the "
+                f"credentials, or open instagram.com and clear any pending challenge."
+            ),
+        }
+    except Exception as e:  # noqa: BLE001
+        AUTH.set("needs_login", f"{type(e).__name__}: {e}")
+        return {"success": False, "state": AUTH.state, "message": f"Sign-in failed: {e}"}
+
+    _save_session()
+    _clear_block()
+    AUTH.set("authenticated", f"Signed in as @{AUTH.username}.")
+    logger.info(f"Signed in as @{AUTH.username}")
+    return {"success": True, "state": AUTH.state, "message": AUTH.detail}
+
+
+def _adopt_sessionid() -> bool:
+    """Adopt a browser session supplied to the server as INSTAGRAM_SESSIONID.
+
+    This is the way in for accounts whose 2FA is an approve-on-device push:
+    Instagram issues no code for those, and the login API cannot wait for the
+    tap, so a session established in a browser is the only thing that works.
+
+    The value is read from the server's own environment and never crosses the
+    MCP boundary. A sessionid is a bearer token for the entire account with a
+    long life, so it must not pass through an agent, a tool call, or a chat
+    transcript — unlike a 2FA code, it is worth stealing and reusable if it is.
+    """
+    if not AUTH.sessionid:
+        return False
+
+    logger.info("Adopting the session from INSTAGRAM_SESSIONID")
+    try:
+        client.login_by_sessionid(AUTH.sessionid)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"INSTAGRAM_SESSIONID was rejected ({type(e).__name__}: {e})")
+        AUTH.set("needs_login", f"The configured sessionid was rejected: {type(e).__name__}.")
+        return False
+
+    # Resolve who we just became. The cookie carries the user id as its prefix,
+    # which is the fallback when the user-info endpoint is unhappy.
+    username = None
+    try:
+        username = client.account_info().username
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"account_info() after sessionid login failed: {e}")
+        try:
+            username = client.user_info_v1(int(AUTH.sessionid.split(":")[0])).username
+        except Exception:  # noqa: BLE001
+            username = AUTH.username
+
+    if not username:
+        AUTH.set("needs_login", "Signed in by sessionid but could not resolve the username.")
+        return False
+
+    # The sessionid may belong to a different account than the configured one,
+    # so the session file follows the account actually obtained.
+    AUTH.username = username
+    if AUTH.session_dir:
+        AUTH.session_file = AUTH.session_dir / f"{username}_session.json"
+        try:
+            (AUTH.session_dir / "current_user.txt").write_text(username)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _save_session()
+    _clear_block()
+    AUTH.set("authenticated", f"Signed in as @{username} from a supplied browser session.")
+    logger.info(f"Signed in as @{username} via INSTAGRAM_SESSIONID")
+    return True
+
+
+def _load_session() -> bool:
+    """Adopt an existing session file if it still works."""
+    if not AUTH.session_file or not AUTH.session_file.exists():
+        return False
+    logger.info(f"Loading existing session from {AUTH.session_file}")
+    try:
+        client.load_settings(AUTH.session_file)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not read {AUTH.session_file}: {e}")
+        return False
+    try:
+        info = client.account_info()
+        AUTH.set("authenticated", f"Signed in as @{info.username} from a saved session.")
+        logger.info(f"Session valid for @{info.username}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        # Instagram's mobile API frequently returns 467 on the user-info
+        # endpoint for browser-derived sessions that still authorize other
+        # calls, so a failed probe is not proof the session is dead.
+        if AUTH.sessionid:
+            # ...but a supplied browser session is known-good and costs no login
+            # attempt, so prefer it over a saved session that just failed. Without
+            # this, setting INSTAGRAM_SESSIONID to recover from an expired session
+            # would be silently ignored in favour of the expired file.
+            logger.warning(
+                f"account_info() probe failed ({e}); preferring the supplied "
+                f"INSTAGRAM_SESSIONID over the saved session."
+            )
+            return False
+        logger.warning(f"account_info() probe failed ({e}); trusting the loaded session.")
+        AUTH.set("authenticated", "Signed in from a saved session (probe inconclusive).")
+        return True
+
+
+def bootstrap_auth() -> None:
+    """Get as far toward a usable session as possible, without ever exiting."""
+    if _load_session():
+        return
+
+    # A supplied browser session outranks a password login: it is already past
+    # whatever 2FA the account uses, so it neither prompts nor risks a failed
+    # login against the account.
+    if _adopt_sessionid():
+        return
+
+    if not AUTH.username or not AUTH.password:
+        AUTH.set(
+            "unconfigured",
+            "No saved session, and no username/password configured. Run auth.py, or set "
+            "INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD.",
+        )
+        logger.error(AUTH.detail)
+        return
+
+    blocked = _read_block()
+    if blocked:
+        # A block records that the login could not be completed with what the
+        # server had at the time. A TOTP seed configured since then is a new
+        # capability — it can now produce the code it was missing — so the block
+        # no longer describes the situation and is worth one fresh attempt. If
+        # that attempt fails too, it is re-recorded with had_totp_seed set and
+        # later starts stop trying.
+        if AUTH.totp_seed and not blocked.get("had_totp_seed"):
+            logger.info(
+                "A TOTP seed is configured now, but the recorded block predates it — "
+                "clearing it and retrying the sign-in once."
+            )
+            _clear_block()
+        else:
+            AUTH.set(
+                "blocked",
+                f"A previous sign-in failed with {blocked.get('error')} at {blocked.get('at')} "
+                f"({blocked.get('detail')}). No login was attempted.",
+            )
+            logger.error(
+                f"{AUTH.detail} Call the instagram_login tool (with a 2FA code if needed) "
+                f"or run auth.py; either clears {AUTH.block_file}."
+            )
+            return
+
+    logger.info("No usable session; attempting a fresh login...")
+    result = _attempt_login()
+    if not result["success"]:
+        logger.error(f"Startup sign-in incomplete ({AUTH.state}): {result['message']}")
+
+
+@mcp.tool()
+def instagram_auth_status() -> Dict[str, Any]:
+    """Report whether the server is signed in to Instagram, and what it needs if not.
+
+    Call this first whenever another tool reports that the server is not signed in.
+
+    Returns:
+        A dictionary with the current auth state and the next step to take.
+    """
+    # With a seed configured the server mints its own 2FA code, so the caller
+    # should just trigger a login rather than going to the user for a code that
+    # is neither needed nor, for push-approval accounts, ever issued.
+    # Only when the seed is the deciding factor. States like blocked or
+    # unconfigured are not fixed by another login attempt — advising one there
+    # would drive exactly the repeated failed logins the block exists to stop.
+    if AUTH.totp_seed and not AUTH.authenticated and AUTH.state not in ("blocked", "unconfigured"):
+        if AUTH.state == "bad_totp_seed":
+            step = (
+                "INSTAGRAM_TOTP_SEED is not a usable base32 secret, so the server cannot "
+                "generate a code. This is a server configuration problem that no 2FA code "
+                "from the user will fix. Spacing and case are handled automatically, so the "
+                "value itself is wrong — most likely a backup code or recovery phrase was "
+                "copied instead of the authenticator key Instagram shows when you set up "
+                "an authenticator app."
+            )
+        elif AUTH.totp_rejected:
+            step = (
+                "Instagram rejected the code the server generated, so INSTAGRAM_TOTP_SEED is "
+                "not this account's authenticator seed. Do not call instagram_login without a "
+                "code — it regenerates the same rejected code. Ask the user for one live code "
+                "to get in now, and tell them the server's seed needs correcting (or "
+                "INSTAGRAM_SESSIONID set) so restarts work unattended."
+            )
+        else:
+            step = (
+                "Call instagram_login with no verification_code. A TOTP seed is configured, "
+                "so the server generates the 2FA code itself — do not ask the user for one."
+            )
+        return {
+            "authenticated": False,
+            "state": AUTH.state,
+            "username": AUTH.username,
+            "detail": AUTH.detail,
+            "totp_seed_configured": True,
+            "session_file": str(AUTH.session_file) if AUTH.session_file else None,
+            "next_step": step,
+        }
+
+    next_step = {
+        "authenticated": "Nothing to do.",
+        "needs_2fa": (
+            "Ask the user for the current 6-digit 2FA code, then call instagram_login "
+            "with verification_code set. An 8-digit backup code works too. If their 2FA "
+            "is an approve-on-device push, Instagram issues no code at all — tell the user "
+            "the server operator needs to set INSTAGRAM_SESSIONID (or INSTAGRAM_TOTP_SEED) "
+            "in the server's own configuration. Never ask anyone to paste a session cookie "
+            "to you; it is a password-equivalent credential and must not pass through here."
+        ),
+        "needs_login": "Call instagram_login to retry the sign-in.",
+        "blocked": (
+            "A previous sign-in failed in a way that needs a person. If it was 2FA, ask "
+            "the user for a fresh code and call instagram_login with verification_code, or "
+            "tell the user to set INSTAGRAM_SESSIONID on the server when the account "
+            "approves logins by push instead of by code. Otherwise the credentials or "
+            "account need attention."
+        ),
+        "unconfigured": (
+            "The server has no credentials. Set INSTAGRAM_USERNAME and "
+            "INSTAGRAM_PASSWORD, or run auth.py, then restart."
+        ),
+    }.get(AUTH.state, "Call instagram_login.")
+
+    return {
+        "authenticated": AUTH.authenticated,
+        "state": AUTH.state,
+        "username": AUTH.username,
+        "detail": AUTH.detail,
+        "totp_seed_configured": bool(AUTH.totp_seed),
+        "session_file": str(AUTH.session_file) if AUTH.session_file else None,
+        "next_step": next_step,
+    }
+
+
+@mcp.tool()
+@rate_limited("login")
+def instagram_login(
+    verification_code: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Sign in to Instagram, optionally completing two-factor authentication.
+
+    Credentials are read from the server's own configuration and are never passed
+    in through this tool. Only the 2FA code, which the user reads off their phone,
+    comes from the caller.
+
+    Args:
+        verification_code: The current 6-digit 2FA code, if Instagram asked for one.
+            These expire in about 30 seconds, so send it as soon as the user gives it.
+        force: Sign in again even when the server believes it is already signed in.
+            Use when tools fail with authentication errors despite a healthy status —
+            a restored session is trusted without proof, so it can be silently stale.
+    Returns:
+        A dictionary with success status, the resulting auth state, and a message.
+    """
+    if AUTH.authenticated and not verification_code and not force:
+        return {
+            "success": True,
+            "state": AUTH.state,
+            "message": (
+                f"Already signed in as @{AUTH.username}. If Instagram tools are failing "
+                f"with authentication errors anyway, call again with force=true to "
+                f"replace a session that has gone stale."
+            ),
+        }
+
+    code = (verification_code or "").strip()
+    if code:
+        # An operator supplying a code is the human step the block was waiting
+        # for, so stop refusing before trying it.
+        _clear_block()
+
+    result = _attempt_login(verification_code=code)
+    logger.info(f"instagram_login via tool -> {result['state']}")
+    return result
 
 
 @mcp.tool()
@@ -857,6 +1332,45 @@ def delete_message(thread_id: str, message_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @rate_limited("modify")
+def hide_chat(thread_id: str, move_to_spam: bool = False) -> Dict[str, Any]:
+    """Remove a direct message conversation from the inbox.
+
+    This is what Instagram's own "Delete" on a chat does: the thread is hidden
+    from your inbox, not erased for the other person, and it reappears if they
+    send another message.
+
+    Args:
+        thread_id: The thread ID to remove from the inbox.
+        move_to_spam: True to file it under hidden requests (spam) instead of
+            simply hiding it. Defaults to False.
+    Returns:
+        A dictionary with success status and a status message.
+    """
+    if not thread_id:
+        return {"success": False, "message": "thread_id must be provided."}
+
+    try:
+        thread_id_int = int(thread_id)
+    except (TypeError, ValueError):
+        return {"success": False, "message": f"thread_id must be numeric, got {thread_id!r}."}
+
+    try:
+        result = client.direct_thread_hide(thread_id_int, move_to_spam=move_to_spam)
+        if result:
+            where = "moved to hidden requests (spam)" if move_to_spam else "hidden from the inbox"
+            return {
+                "success": True,
+                "message": f"Chat {where}. It returns to the inbox if they message again.",
+                "thread_id": thread_id,
+                "moved_to_spam": move_to_spam,
+            }
+        return {"success": False, "message": "Instagram did not confirm hiding the chat."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@mcp.tool()
+@rate_limited("modify")
 def mute_conversation(thread_id: str, mute: bool = True) -> Dict[str, Any]:
     """Mute or unmute a direct message conversation.
 
@@ -889,7 +1403,43 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--username", type=str, help="Instagram username (also via INSTAGRAM_USERNAME env)")
     parser.add_argument("--password", type=str, help="Instagram password (also via INSTAGRAM_PASSWORD env)")
+    parser.add_argument(
+        "--transport",
+        type=str,
+        choices=["stdio", "streamable-http", "sse"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="MCP transport to serve on (also via MCP_TRANSPORT env). Default: stdio",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="Bind address for HTTP transports (also via MCP_HOST env). Default: 127.0.0.1",
+    )
+    # Resolved before the parser is built, so a bad value reports itself rather
+    # than raising ValueError out of the default expression as a bare traceback.
+    _env_port = (os.getenv("MCP_PORT") or "").strip()
+    try:
+        _default_port = int(_env_port) if _env_port else 8000
+    except ValueError:
+        print(f"Error: MCP_PORT is not a number ({_env_port!r})")
+        exit(1)
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_default_port,
+        help="Bind port for HTTP transports (also via MCP_PORT env). Default: 8000",
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=os.getenv("MCP_PATH"),
+        help="HTTP path the MCP endpoint is mounted at (also via MCP_PATH env). Default: /mcp for streamable-http, /sse for sse",
+    )
     args = parser.parse_args()
+
+    MCP_ENDPOINT = args.path or ("/sse" if args.transport == "sse" else "/mcp")
 
     # Resolve username: CLI arg > env var > current_user.txt written by auth.py
     # Session files live in the user data dir (per OS user, isolated from
@@ -916,57 +1466,64 @@ if __name__ == "__main__":
     if not username and CURRENT_USER_FILE.exists():
         username = CURRENT_USER_FILE.read_text().strip() or None
 
-    if not username:
-        logger.error("No username provided and no current_user.txt found. Run auth.py via OpenSwarm or `python auth.py` first.")
-        print("Error: no Instagram session — run auth.py first.")
-        exit(1)
+    if username:
+        SESSION_FILE = SESSION_DIR / f"{username}_session.json"
+        _legacy_session = _LEGACY_ROOT / f"{username}_session.json"
+        if _legacy_session.exists() and not SESSION_FILE.exists():
+            try:
+                SESSION_FILE.write_bytes(_legacy_session.read_bytes())
+                logger.info(f"Migrated {username} session to {SESSION_FILE}")
+            except Exception:
+                pass
+    else:
+        SESSION_FILE = None
+        logger.error("No username configured and no current_user.txt found.")
 
-    SESSION_FILE = SESSION_DIR / f"{username}_session.json"
-    _legacy_session = _LEGACY_ROOT / f"{username}_session.json"
-    if _legacy_session.exists() and not SESSION_FILE.exists():
-        try:
-            SESSION_FILE.write_bytes(_legacy_session.read_bytes())
-            logger.info(f"Migrated {username} session to {SESSION_FILE}")
-        except Exception:
-            pass
-    password = args.password or os.getenv("INSTAGRAM_PASSWORD")
+    AUTH.username = username
+    AUTH.password = args.password or os.getenv("INSTAGRAM_PASSWORD")
+    # Instagram shows the TOTP seed in spaced groups of four, and base32 accepts
+    # neither spaces nor a lowercase-only reading, so a verbatim copy/paste is
+    # unusable as-is. Normalise rather than make everyone notice that.
+    # Strip only the separators Instagram's own display uses. Deleting every
+    # non-base32 character instead would quietly turn a malformed secret (one
+    # containing 0, 1, 8 or 9) into a valid-looking one that mints wrong codes
+    # forever; leaving those in means it fails loudly as bad_totp_seed, which
+    # is the accurate diagnosis.
+    _raw_seed = os.getenv("INSTAGRAM_TOTP_SEED") or ""
+    AUTH.totp_seed = re.sub(r"[\s\-_]", "", _raw_seed).upper() or None
+    if _raw_seed and AUTH.totp_seed != _raw_seed.strip():
+        logger.info("Normalised INSTAGRAM_TOTP_SEED (stripped separators, uppercased)")
+    _raw_sessionid = os.getenv("INSTAGRAM_SESSIONID") or ""
+    AUTH.sessionid = unquote(_raw_sessionid.strip().strip('"')) or None
+    AUTH.session_dir = SESSION_DIR
+    AUTH.session_file = SESSION_FILE
+
+    # Sign-in is attempted once here and never retried on a loop: if it cannot
+    # complete, the server still starts and reports what it needs through the
+    # instagram_auth_status / instagram_login tools.
+    bootstrap_auth()
+    if AUTH.authenticated:
+        logger.info(f"Successfully authenticated to Instagram ({AUTH.detail})")
+    else:
+        logger.warning(
+            f"Starting without a usable Instagram session (state: {AUTH.state}). "
+            f"Instagram tools will refuse until you sign in via the instagram_login tool."
+        )
 
     try:
-        if SESSION_FILE.exists():
-            logger.info(f"Loading existing session from {SESSION_FILE}")
-            client.load_settings(SESSION_FILE)
-            # Validate. If the saved session still works, skip login() entirely
-            # (login() would re-issue 2FA challenges we can't handle here).
-            try:
-                info = client.account_info()
-                logger.info(f"Session valid for @{info.username}")
-            except Exception as session_err:  # noqa: BLE001
-                logger.warning(f"account_info() probe failed ({session_err}); proceeding with loaded session.")
-                # Instagram's mobile API (i.instagram.com) frequently returns 467
-                # on the user-info endpoint for sessions that originated in a
-                # browser, even when those cookies still authorize other calls.
-                # If a password is available we try a fresh login; otherwise we
-                # trust the loaded session and let actual tool calls surface
-                # any auth issues at use time.
-                if password:
-                    try:
-                        client.login(username, password)
-                        client.dump_settings(SESSION_FILE)
-                    except Exception as login_err:  # noqa: BLE001
-                        logger.warning(f"Fallback login also failed ({login_err}); using loaded session as-is.")
+        if args.transport == "stdio":
+            logger.info("Serving MCP over stdio")
+            # The startup banner would go to stdout and corrupt the JSON-RPC stream.
+            mcp.run(transport="stdio", show_banner=False)
         else:
-            if not password:
-                logger.error(f"No session at {SESSION_FILE} and no password — run auth.py first.")
-                print("Error: no Instagram session — sign in first.")
-                exit(1)
-            logger.info("No session file; attempting fresh login...")
-            client.login(username, password)
-            client.dump_settings(SESSION_FILE)
-            logger.info(f"Session saved to {SESSION_FILE}")
-
-        logger.info("Successfully authenticated to Instagram")
-        mcp.run(transport="stdio")
+            logger.info(f"Serving MCP over {args.transport} at http://{args.host}:{args.port}{MCP_ENDPOINT}")
+            mcp.run(
+                transport=args.transport,
+                host=args.host,
+                port=args.port,
+                path=MCP_ENDPOINT,
+            )
     except Exception as e:
-        logger.error(f"Failed to authenticate to Instagram: {str(e)}")
-        print(f"Error: Failed to authenticate to Instagram - {str(e)}")
+        logger.error(f"MCP server stopped with an error: {e}")
+        print(f"Error: MCP server stopped - {e}")
         exit(1)

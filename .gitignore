@@ -12,4 +12,5 @@ pyvenv.cfg
 # hijack the account.
 *_session.json
 current_user.txt
+login_blocked.json
 .instagram-mcp-rate-limits.json

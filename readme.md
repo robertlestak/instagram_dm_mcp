@@ -156,12 +156,193 @@ https://github.com/user-attachments/assets/9c945f25-4484-4223-8d6b-5bf31243464c
    Or restart Cursor.
 ---
 
+## Transports
+
+The server speaks **stdio** (default) and **streamable-http**; legacy **sse** is also available.
+Every flag has an environment-variable equivalent.
+
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--transport` | `MCP_TRANSPORT` | `stdio` | `stdio`, `streamable-http`, or `sse` |
+| `--host` | `MCP_HOST` | `127.0.0.1` | HTTP transports only |
+| `--port` | `MCP_PORT` | `8000` | HTTP transports only |
+| `--path` | `MCP_PATH` | `/mcp` (`/sse` for sse) | Endpoint mount path |
+
+Run it over HTTP:
+
+```bash
+python src/mcp_server.py --transport streamable-http --port 8000
+# → serving at http://127.0.0.1:8000/mcp
+```
+
+Then point a client at the URL instead of spawning a subprocess:
+
+```json
+{
+  "mcpServers": {
+    "instagram_dms": {
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+**Mind the trailing slash.** The endpoint is `/mcp`; `/mcp/` answers `307 Temporary
+Redirect`. Clients that don't follow redirects on POST report that as a connection
+failure, so use the exact path.
+
+Note that the server holds one authenticated Instagram session, so an HTTP listener
+exposes that account to anything that can reach the port. Keep it bound to `127.0.0.1`
+unless you have put your own authentication in front of it.
+
+---
+
+## Docker
+
+The image defaults to `streamable-http` on port 8000, since stdio can't be reached from
+outside a container.
+
+```bash
+docker build -t instagram-dm-mcp .
+```
+
+Session state and rate-limit counters are both written under `$HOME`, which the image
+points at `/data`. Mount a volume there so a sign-in survives container restarts —
+without it, every restart requires a fresh login (and repeated logins is exactly what
+gets Instagram accounts flagged).
+
+**1. Sign in once** — interactive, because Instagram may prompt for a 2FA code:
+
+```bash
+docker run -it --rm -v ig-mcp-data:/data instagram-dm-mcp auth.py
+```
+
+**2. Run the server:**
+
+```bash
+docker run -d --name instagram-dm-mcp \
+  -p 127.0.0.1:8000:8000 \
+  -v ig-mcp-data:/data \
+  instagram-dm-mcp
+```
+
+Point your client at `http://127.0.0.1:8000/mcp` (see the trailing-slash note above).
+
+Publishing as `-p 127.0.0.1:8000:8000` rather than `-p 8000:8000` keeps the port on the
+loopback interface. A bare `-p 8000:8000` exposes your authenticated Instagram account to
+your whole network — the server itself has no authentication.
+
+Transport settings are read from the environment, so they can be overridden per run:
+
+```bash
+docker run -d -e MCP_PORT=9000 -p 127.0.0.1:9000:9000 -v ig-mcp-data:/data instagram-dm-mcp
+```
+
+### Signing in without a terminal
+
+A container has nobody to type a 2FA code at it, so signing in is part of the server
+rather than a separate interactive script. **The server always starts**, with or without
+a usable session. If it can't sign in, it stays up and says so instead of exiting — a
+server that exits gets restarted by Docker or Kubernetes, and the retried login every few
+minutes is what gets accounts flagged.
+
+While signed out, Instagram tools return `Not signed in to Instagram (needs_2fa): …` and
+two tools stay available to fix it:
+
+- `instagram_auth_status` — the current state and the next step to take.
+- `instagram_login` — performs the sign-in, taking `verification_code` for 2FA.
+
+So the flow through any MCP client is just a conversation:
+
+> **You:** check the instagram auth status
+> **Claude:** It needs a 2FA code — what does your authenticator app show?
+> **You:** 481920
+> **Claude:** *(calls `instagram_login` with the code)* Signed in as @you.
+
+**No credential ever passes through the agent.** Everything that grants access to the
+account — password, session cookie, TOTP seed — is read from the server's own
+environment, listed below. The only thing a tool ever accepts is a 2FA code, which is
+single-use and dead within about 30 seconds, and worthless without the password it
+never sees.
+
+| Env var | What it is | Why it's server-side |
+|---------|-----------|----------------------|
+| `INSTAGRAM_USERNAME` / `INSTAGRAM_PASSWORD` | The account credentials | Full account access |
+| `INSTAGRAM_TOTP_SEED` | Authenticator-app seed | Mints codes forever; equivalent to owning the second factor |
+| `INSTAGRAM_SESSIONID` | Cookie from a signed-in browser | Long-lived bearer token for the whole account |
+
+The session is written to the volume, so this is a one-time step, not something you
+repeat on every restart.
+
+**Fully headless:** if the account's 2FA is an authenticator app, put its seed in
+`INSTAGRAM_TOTP_SEED` and the server generates its own code at login — no human at all,
+including after a session expires. Paste the seed however Instagram gives it to you; the
+spaced groups of four and any case are normalised before use.
+
+### When 2FA is an approve-on-device push
+
+Some accounts don't get a code at all — Instagram sends a notification to a phone that is
+already signed in and asks you to approve or deny it. There is no code to type, and the
+login API has no way to wait for the tap, so `instagram_login` cannot complete. Three ways
+through, best last:
+
+1. **A backup code.** In the app: Accounts Center → Password and security → Two-factor
+   authentication → your account → Additional methods → Backup codes. Pass one of the
+   8-digit codes as `verification_code` to `instagram_login`. Each works once.
+2. **A browser session, handed to the server.** Sign in at instagram.com, approve the
+   push, copy the `sessionid` cookie (DevTools → Application → Cookies), and set it as
+   `INSTAGRAM_SESSIONID` in the server's own environment — the same place the password
+   lives. The server adopts it at startup and writes a durable session to the volume, so
+   the variable can be removed afterwards.
+3. **Add an authenticator app** as a second 2FA method and set `INSTAGRAM_TOTP_SEED`.
+   This is the only option that survives a session expiry unattended, so it's the one
+   worth doing for an always-on deployment.
+
+**Failed logins are not retried.** A failure only a human can clear (2FA, wrong password,
+a challenge) is recorded in `login_blocked.json` next to the session, and later starts
+refuse to attempt another login rather than contacting Instagram — calling
+`instagram_login`, or running `auth.py`, clears it. A valid session file takes precedence,
+so a stale marker never blocks a working server.
+
+`auth.py` still exists for signing in from a terminal, and is the better option locally:
+
+```bash
+docker run -it --rm -v ig-mcp-data:/data instagram-dm-mcp auth.py
+```
+
+### Volume permissions
+
+The container runs as uid 10001. A Docker named volume inherits ownership from the image
+and just works, but a mount that arrives root-owned — a bind mount of a host directory, or
+a freshly provisioned Kubernetes PV — does not, and the first session write fails with
+`PermissionError: [Errno 13] Permission denied: '/data/.instagram_dm_mcp'`.
+
+For a bind mount, run as the owning user:
+
+```bash
+docker run --user "$(id -u):$(id -g)" -v "$PWD/data:/data" instagram-dm-mcp
+```
+
+On Kubernetes, set `fsGroup` so the kubelet chowns the volume at mount time:
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+```
+
+---
+
 ## Usage
 
 Below is a list of all available tools and what they do:
 
 | Tool Name                   | Description                                                                                   |
 |-----------------------------|-----------------------------------------------------------------------------------------------|
+| `instagram_auth_status`     | Report whether the server is signed in, and what it needs if not. Always available.            |
+| `instagram_login`           | Sign in, optionally completing 2FA with a code the user reads off their phone. Always available. |
 | `send_message`              | Send an Instagram direct message to a user by username.                                       |
 | `send_photo_message`        | Send a photo as an Instagram direct message to a user by username.                            |
 | `send_video_message`        | Send a video as an Instagram direct message to a user by username.                            |
@@ -171,6 +352,10 @@ Below is a list of all available tools and what they do:
 | `download_shared_post_from_message` | Download media from a shared post, reel, or clip in a DM message (not for direct uploads). |
 | `list_media_messages`       | List all messages containing direct-uploaded media (photo/video) in a DM thread.              |
 | `mark_message_seen`         | Mark a specific message in an Instagram Direct Message thread as seen.                         |
+| `delete_message`            | Delete a message from a direct message thread.                                                 |
+| `mute_conversation`         | Mute or unmute a direct message conversation.                                                  |
+| `hide_chat`                 | Remove a chat from your inbox (Instagram's "Delete"), optionally filing it under hidden requests. |
+| `check_user_online_status`  | Check the online status of Instagram users.                                                    |
 | `list_pending_chats`        | Get Instagram Direct Message threads from your pending inbox.                                  |
 | `search_threads`            | Search Instagram Direct Message threads by username or keyword.                                |
 | `get_thread_by_participants`| Get an Instagram Direct Message thread by participant user IDs.                                |

@@ -1,0 +1,20 @@
+.git
+.gitignore
+.venv
+bin
+lib
+include
+pyvenv.cfg
+**/__pycache__
+*.pyc
+
+# Never bake credentials or session state into an image layer.
+.env
+*_session.json
+current_user.txt
+login_blocked.json
+.instagram-mcp-rate-limits.json
+
+readme.md
+LICENSE
+env.example

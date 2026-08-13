@@ -40,6 +40,25 @@ from instagrapi.exceptions import (
 )
 
 
+def _clear_login_block(session_dir: Path, quiet: bool = False) -> None:
+    """Drop the marker that stops mcp_server.py from retrying a failed login.
+
+    The server writes it when a login fails for a reason only a human can clear,
+    so that restarts don't hammer Instagram. A successful sign-in here is that
+    human step.
+    """
+    block_file = session_dir / "login_blocked.json"
+    try:
+        block_file.unlink()
+        if not quiet:
+            print(f"Cleared {block_file}; the server will start normally again.")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"WARNING: could not remove {block_file} ({e}); the server will keep "
+              f"refusing to log in until it is deleted.", file=sys.stderr)
+
+
 def _from_browser(session_dir: Path) -> int:
     """Build session from browser cookies. Reads JSON on stdin, writes JSON on stdout."""
     def _dbg(msg: str) -> None:
@@ -191,6 +210,9 @@ def _from_browser(session_dir: Path) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    # Quiet: this path's stdout is machine-read JSON.
+    _clear_login_block(session_dir, quiet=True)
+
     _dbg(f"success, saved {session_file}")
     print(json.dumps({
         "ok": True,
@@ -241,6 +263,7 @@ def main() -> int:
         try:
             cl.load_settings(session_file)
             cl.get_timeline_feed()
+            _clear_login_block(session_dir)
             print(f"Existing session at {session_file} is valid. Nothing to do.")
             return 0
         except Exception as e:  # noqa: BLE001
@@ -292,6 +315,7 @@ def main() -> int:
         (Path(args.session_dir) / "current_user.txt").write_text(username)
     except Exception:  # noqa: BLE001
         pass
+    _clear_login_block(session_dir)
     print(f"Session saved to {session_file}")
     print("Done. The MCP server can now boot without prompting for 2FA again.")
     return 0

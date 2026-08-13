@@ -7,7 +7,9 @@ velocity (DMs, likes, follows). Even legitimate agent use can trigger
 below Instagram's documented thresholds plus jitter to mimic human pacing.
 
 State persists across server restarts to ~/.instagram-mcp-rate-limits.json
-so a relaunch does not reset the daily budget.
+so a relaunch does not reset the daily budget. Reserving a slot is serialised
+by ~/.instagram-mcp-rate-limits.json.lock across both threads and processes,
+since the HTTP transport lets several callers share one server.
 
 Per-category defaults (conservative; Instagram's real limits are higher):
 
@@ -17,6 +19,7 @@ Per-category defaults (conservative; Instagram's real limits are higher):
   search         30         200     1000    0.0-0.5s
   lookup         30         300     2000    0.0-0.5s
   modify         10         100      500    0.0-0.5s
+  login           4          10       20    0.0-0.5s
 
 Override any cap via env var, e.g.:
   IG_RATE_LIMIT_DM_SEND_PER_DAY=40
@@ -29,13 +32,22 @@ import json
 import logging
 import os
 import random
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Tuple
+
+try:  # POSIX only; the in-process lock still applies without it.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
 _STATE_PATH = Path.home() / ".instagram-mcp-rate-limits.json"
+_LOCK_PATH = _STATE_PATH.with_name(_STATE_PATH.name + ".lock")
+_THREAD_LOCK = threading.Lock()
 
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "dm_send": {"per_minute": 2,  "per_hour": 20,  "per_day": 80,   "jitter": (1.5, 4.0)},
@@ -43,6 +55,11 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     "search":  {"per_minute": 30, "per_hour": 200, "per_day": 1000, "jitter": (0.0, 0.5)},
     "lookup":  {"per_minute": 30, "per_hour": 300, "per_day": 2000, "jitter": (0.0, 0.5)},
     "modify":  {"per_minute": 10, "per_hour": 100, "per_day": 500,  "jitter": (0.0, 0.5)},
+    # Sign-in is the most ban-prone action, so the hour/day caps stay tight. The
+    # per-minute cap has to leave room for a person mistyping a 2FA code, though:
+    # codes expire in ~30s, so anything stricter would expire the replacement
+    # code while the caller waits and make the flow impossible to complete.
+    "login":   {"per_minute": 4,  "per_hour": 10,  "per_day": 20,   "jitter": (0.0, 0.5)},
 }
 
 
@@ -70,6 +87,43 @@ def _get_limits(category: str) -> Dict[str, Any]:
     }
 
 
+@contextmanager
+def _state_lock() -> Iterator[None]:
+    """Serialise the read-modify-write of the state file.
+
+    Two layers, because there are two ways to race. FastMCP dispatches sync
+    tools onto a thread pool, so one process can be inside here twice at once;
+    and several processes can share one state file (a mounted volume, or
+    auth.py running alongside the server). Unserialised, two callers read the
+    same counts, both append, and the second write erases the first
+    reservation — under-counting the very budget this module exists to enforce.
+
+    A dedicated lock file is used rather than the state file itself, because
+    _save_state replaces the state file's inode and would drop the lock with it.
+    """
+    with _THREAD_LOCK:
+        if fcntl is None:
+            yield
+            return
+        try:
+            fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not open the rate-limit lock file (%s); falling back to the "
+                "in-process lock, which does not serialise other processes.", exc
+            )
+            yield
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _load_state() -> Dict[str, List[float]]:
     if not _STATE_PATH.exists():
         return {}
@@ -82,10 +136,19 @@ def _load_state() -> Dict[str, List[float]]:
 
 
 def _save_state(state: Dict[str, List[float]]) -> None:
+    # Write-then-rename: a crash partway through a plain write would leave
+    # unparseable JSON, and _load_state treats that as "start fresh" — silently
+    # handing back a full day's budget. os.replace is atomic on POSIX.
+    tmp = _STATE_PATH.with_name(f"{_STATE_PATH.name}.{os.getpid()}.tmp")
     try:
-        _STATE_PATH.write_text(json.dumps(state))
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, _STATE_PATH)
     except Exception as exc:
         logger.warning("Failed to persist rate-limit state: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _prune(timestamps: List[float], now: float, window_s: int) -> List[float]:
@@ -146,8 +209,14 @@ def rate_limited(category: str) -> Callable[[Callable[..., Dict[str, Any]]], Cal
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             limits = _get_limits(category)
-            state = _load_state()
-            ok, reason, retry_after, current = _check_budget(category, limits, state)
+            # Checking the budget and consuming a slot has to be one atomic
+            # step, or two callers both pass a check that only had room for one.
+            with _state_lock():
+                state = _load_state()
+                ok, reason, retry_after, current = _check_budget(category, limits, state)
+                if ok:
+                    state.setdefault(category, []).append(time.time())
+                    _save_state(state)
             if not ok:
                 logger.warning("Rate limit blocked %s: %s", func.__name__, reason)
                 return {
@@ -162,8 +231,8 @@ def rate_limited(category: str) -> Callable[[Callable[..., Dict[str, Any]]], Cal
                     "limits": {k: limits[k] for k in ("per_minute", "per_hour", "per_day")},
                     "current": current,
                 }
-            state.setdefault(category, []).append(time.time())
-            _save_state(state)
+            # Jitter sleeps outside the lock: a 4-second dm_send pause held
+            # under it would serialise every other tool in the server.
             lo, hi = limits["jitter"]
             if hi > 0:
                 time.sleep(random.uniform(lo, hi))
