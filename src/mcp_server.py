@@ -588,26 +588,41 @@ def instagram_login(
 
 @mcp.tool()
 @rate_limited("dm_send")
-def send_message(username: str, message: str) -> Dict[str, Any]:
-    """Send an Instagram direct message to a user by username.
+def send_message(message: str, username: str = "", thread_id: str = "") -> Dict[str, Any]:
+    """Send an Instagram direct message, to a user by username or into an existing thread.
+
+    Pass thread_id to post a plain message into a thread — the only way to reach a
+    group chat, since a group has no username to address. Use list_chats to find the
+    thread_id. Pass username instead to message one person in your one-to-one thread
+    with them. Exactly one of the two is required.
 
     Args:
-        username: Instagram username of the recipient.
         message: The message text to send.
+        username: Instagram username of the recipient, for a one-to-one message.
+        thread_id: The thread to post into, for a group chat or any existing thread.
     Returns:
         A dictionary with success status and a status message.
     """
-    if not username or not message:
-        return {"success": False, "message": "Username and message must be provided."}
+    if not message:
+        return {"success": False, "message": "Message must be provided."}
+    if bool(username) == bool(thread_id):
+        return {"success": False, "message": "Specify username or thread_id, but not both."}
     try:
-        user_id = client.user_id_from_username(username)
-        if not user_id:
-            return {"success": False, "message": f"User '{username}' not found."}
-        dm = client.direct_send(message, [user_id])
+        if thread_id:
+            dm = client.direct_send(message, thread_ids=[int(thread_id)])
+            sent_to = "Message sent to thread."
+        else:
+            user_id = client.user_id_from_username(username)
+            if not user_id:
+                return {"success": False, "message": f"User '{username}' not found."}
+            dm = client.direct_send(message, [user_id])
+            sent_to = "Message sent to user."
         if dm:
-            return {"success": True, "message": "Message sent to user.", "direct_message_id": getattr(dm, 'id', None)}
+            return {"success": True, "message": sent_to, "direct_message_id": getattr(dm, 'id', None)}
         else:
             return {"success": False, "message": "Failed to send message."}
+    except ValueError:
+        return {"success": False, "message": f"Invalid thread_id: '{thread_id}'."}
     except Exception as e:
         return {"success": False, "message": str(e)}
 

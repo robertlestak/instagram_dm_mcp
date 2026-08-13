@@ -369,7 +369,7 @@ Below is a list of all available tools and what they do:
 |-----------------------------|-----------------------------------------------------------------------------------------------|
 | `instagram_auth_status`     | Report whether the server is signed in, and what it needs if not. Always available.            |
 | `instagram_login`           | Sign in, optionally completing 2FA with a code the user reads off their phone. Always available. |
-| `send_message`              | Send an Instagram direct message to a user by username.                                       |
+| `send_message`              | Send a direct message, to a user by username or into a thread by `thread_id` (groups included). |
 | `reply_to_message`          | Send a quote reply to a specific message in a thread, rendered with the original quoted above it. |
 | `send_photo_message`        | Send a photo as an Instagram direct message to a user by username.                            |
 | `send_video_message`        | Send a video as an Instagram direct message to a user by username.                            |
