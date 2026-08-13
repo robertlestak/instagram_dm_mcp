@@ -24,6 +24,12 @@ Per-category defaults (conservative; Instagram's real limits are higher):
 Override any cap via env var, e.g.:
   IG_RATE_LIMIT_DM_SEND_PER_DAY=40
   IG_RATE_LIMIT_LIKE_PER_HOUR=15
+
+If the state file cannot be written, calls are blocked rather than run
+uncounted: the in-memory mirror only knows what this process spent, so any
+other process on the same file would reserve from stale counts. Set
+IG_RATE_LIMIT_MEMORY_FALLBACK=1 to keep serving from memory instead — safe
+only when a single process owns the file.
 """
 from __future__ import annotations
 
@@ -54,6 +60,16 @@ _THREAD_LOCK = threading.Lock()
 _MEMORY_STATE: Dict[str, List[float]] = {}
 _PERSISTENCE_OK = True
 
+# What to do when the state cannot be written. The mirror only covers this
+# process, so if anything else shares _STATE_PATH — a second container on the
+# same volume, auth.py beside the server — every process enforces its own copy
+# of the cap and the account sees N times the intended budget. Blocking is the
+# safe default: this module exists to keep the account from being flagged, and
+# an unwritable state file also means sign-in cannot persist, so the deployment
+# needs fixing either way. Operators who know they run exactly one process can
+# trade that back for availability.
+_MEMORY_FALLBACK_VAR = "IG_RATE_LIMIT_MEMORY_FALLBACK"
+
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "dm_send": {"per_minute": 2,  "per_hour": 20,  "per_day": 80,   "jitter": (1.5, 4.0)},
     "like":    {"per_minute": 6,  "per_hour": 30,  "per_day": 200,  "jitter": (0.5, 2.0)},
@@ -80,6 +96,12 @@ def _env_override(category: str, key: str, default: int) -> int:
         return value
     except ValueError:
         return default
+
+
+def _memory_fallback_allowed() -> bool:
+    """Whether an unpersisted reservation may still run. Read per call so the
+    setting can be flipped without a restart."""
+    return os.environ.get(_MEMORY_FALLBACK_VAR, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_limits(category: str) -> Dict[str, Any]:
@@ -157,6 +179,12 @@ def _load_state() -> Dict[str, List[float]]:
         return {}
 
 
+def _remember(state: Dict[str, List[float]]) -> None:
+    """Point the in-memory mirror at `state`, so _load_state can fall back to it."""
+    _MEMORY_STATE.clear()
+    _MEMORY_STATE.update({k: list(v) for k, v in state.items()})
+
+
 def _save_state(state: Dict[str, List[float]]) -> bool:
     """Persist the reservation. Returns whether it reached disk.
 
@@ -164,13 +192,13 @@ def _save_state(state: Dict[str, List[float]]) -> bool:
     unparseable JSON, and _load_state treats that as "start fresh" — silently
     handing back a full day's budget. os.replace is atomic on POSIX.
 
-    The in-memory mirror is kept current either way, so that a write failure
-    downgrades this from "limits enforced across restarts" to "limits enforced
-    for the life of this process" rather than to no limits at all.
+    The in-memory mirror is kept current either way, so the caps still hold
+    within this process. Callers must act on the return value, though: the
+    mirror says nothing about what other processes sharing _STATE_PATH have
+    already spent.
     """
     global _PERSISTENCE_OK
-    _MEMORY_STATE.clear()
-    _MEMORY_STATE.update({k: list(v) for k, v in state.items()})
+    _remember(state)
 
     tmp = _STATE_PATH.with_name(f"{_STATE_PATH.name}.{os.getpid()}.tmp")
     try:
@@ -181,8 +209,11 @@ def _save_state(state: Dict[str, List[float]]) -> bool:
     except Exception as exc:
         if _PERSISTENCE_OK:  # log the transition once, not on every call
             logger.error(
-                "Cannot persist rate-limit state (%s). Still enforcing limits from "
-                "memory, but the budget will reset on restart — fix the volume.", exc
+                "Cannot persist rate-limit state to %s (%s) — fix write access to that "
+                "path. Rate-limited calls are blocked until it recovers; set %s=1 to "
+                "keep serving from the in-memory counts instead (only safe when this "
+                "is the sole process using that file).",
+                _STATE_PATH, exc, _MEMORY_FALLBACK_VAR,
             )
         _PERSISTENCE_OK = False
         try:
@@ -252,12 +283,42 @@ def rate_limited(category: str) -> Callable[[Callable[..., Dict[str, Any]]], Cal
             limits = _get_limits(category)
             # Checking the budget and consuming a slot has to be one atomic
             # step, or two callers both pass a check that only had room for one.
+            unpersisted = False
             with _state_lock():
                 state = _load_state()
                 ok, reason, retry_after, current = _check_budget(category, limits, state)
                 if ok:
-                    state.setdefault(category, []).append(time.time())
-                    _save_state(state)
+                    reserved_at = time.time()
+                    state.setdefault(category, []).append(reserved_at)
+                    if not _save_state(state) and not _memory_fallback_allowed():
+                        # The slot was never durably taken, and the call is about
+                        # to be refused, so give it back — otherwise a broken
+                        # volume burns the whole day's budget on calls that never
+                        # ran. The next call retries the write and recovers on
+                        # its own once the path is writable again.
+                        state[category].remove(reserved_at)
+                        _remember(state)
+                        ok = False
+                        unpersisted = True
+            if unpersisted:
+                logger.warning("Blocked %s: rate-limit state is not persistable", func.__name__)
+                return {
+                    "success": False,
+                    "rate_limited": True,
+                    "category": category,
+                    "message": (
+                        f"Blocked: the rate-limit counters at {_STATE_PATH} could not be "
+                        "saved, so this call cannot be counted against the cap. Any other "
+                        "process sharing that file would reserve from stale counts and "
+                        "push the account past its budget. Restore write access to that "
+                        f"path, or set {_MEMORY_FALLBACK_VAR}=1 to enforce the caps in "
+                        "memory only — safe when this is the only process using it, but "
+                        "the budget then resets on restart."
+                    ),
+                    "retry_after_seconds": 0,
+                    "limits": {k: limits[k] for k in ("per_minute", "per_hour", "per_day")},
+                    "current": current,
+                }
             if not ok:
                 logger.warning("Rate limit blocked %s: %s", func.__name__, reason)
                 return {

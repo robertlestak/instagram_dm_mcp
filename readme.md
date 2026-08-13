@@ -234,7 +234,9 @@ docker build -t instagram-dm-mcp .
 Session state and rate-limit counters are both written under `$HOME`, which the image
 points at `/data`. Mount a volume there so a sign-in survives container restarts —
 without it, every restart requires a fresh login (and repeated logins is exactly what
-gets Instagram accounts flagged).
+gets Instagram accounts flagged). The volume has to be writable by uid 10001: if the
+counters can't be written, rate-limited tools block rather than run uncounted, since
+the in-memory tally can't see what another container on the same volume has spent.
 
 **1. Sign in once** — interactive, because Instagram may prompt for a 2FA code:
 
