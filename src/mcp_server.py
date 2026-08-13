@@ -1295,20 +1295,59 @@ def get_user_posts(username: str, count: int = 12) -> Dict[str, Any]:
         return {"success": False, "message": str(e)}
 
 
-def _ensure_download_directory(download_path: str) -> None:
-    """Ensure download directory exists."""
-    Path(download_path).mkdir(parents=True, exist_ok=True)
+# Downloads land in the user data dir next to the sessions, so the server does
+# not depend on its working directory being writable - under Docker the cwd is
+# owned by root and "./downloads" fails with EACCES.
+DEFAULT_DOWNLOAD_DIR = Path.home() / ".instagram_dm_mcp" / "downloads"
+
+
+def _resolve_download_directory(download_path: str) -> str:
+    """Resolve the download directory, creating it, and default it when unset."""
+    directory = Path(download_path).expanduser() if download_path else DEFAULT_DOWNLOAD_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
+
+
+def _direct_media_kind(media) -> str:
+    """Label a direct message attachment as photo, video or voice."""
+    if getattr(media, 'video_url', None):
+        return "video"
+    if getattr(media, 'audio_url', None):
+        return "voice"
+    return "photo"
 
 
 def _download_single_media(media, download_path: str) -> str:
-    """Download a single media item and return the file path."""
-    media_type = media.media_type
-    if media_type == 1:  # Photo
-        return str(client.photo_download(media.pk, download_path))
-    elif media_type == 2:  # Video
-        return str(client.video_download(media.pk, download_path))
-    else:
-        raise ValueError(f"Unsupported media type: {media_type}")
+    """Download a single media item and return the file path.
+
+    Attachments on a direct message are DirectMedia, which carries its own CDN
+    urls and has no pk - it is not feed media, so photo_download/video_download
+    cannot resolve it. Download those by url, and keep the pk path for the feed
+    Media that the shared-post tools hand over.
+    """
+    media_pk = getattr(media, 'pk', None)
+    media_type = getattr(media, 'media_type', None)
+    if media_pk:
+        if media_type == 1:  # Photo
+            return str(client.photo_download(media_pk, download_path))
+        elif media_type == 2:  # Video
+            return str(client.video_download(media_pk, download_path))
+        else:
+            raise ValueError(f"Unsupported media type: {media_type}")
+
+    # Name by the message-scoped media id so repeat downloads overwrite in place
+    # rather than piling up CDN hashes.
+    filename = f"direct_{getattr(media, 'id', None) or 'media'}"
+    source_url = (
+        getattr(media, 'video_url', None)
+        or getattr(media, 'audio_url', None)
+        or getattr(media, 'thumbnail_url', None)
+    )
+    if not source_url:
+        raise ValueError(f"Message media has no downloadable url (media type: {media_type})")
+    if _direct_media_kind(media) == "photo":
+        return str(client.photo_download_by_url(str(source_url), filename, download_path))
+    return str(client.video_download_by_url(str(source_url), filename, download_path))
 
 
 def _find_message_in_thread(thread_id: str, message_id: str):
@@ -1335,7 +1374,7 @@ def list_media_messages(thread_id: str, limit: int = 100) -> Dict[str, Any]:
             if message.media:
                 media_messages.append({
                     "message_id": str(message.id),
-                    "media_type": "photo" if message.media.media_type == 1 else "video",
+                    "media_type": _direct_media_kind(message.media),
                     "timestamp": str(message.timestamp) if hasattr(message, 'timestamp') else None,
                     "sender_user_id": message.user_id if hasattr(message, 'user_id') else None
                 })
@@ -1353,17 +1392,17 @@ def list_media_messages(thread_id: str, limit: int = 100) -> Dict[str, Any]:
 
 @mcp.tool()
 @rate_limited("lookup")
-def download_media_from_message(message_id: str, thread_id: str, download_path: str = "./downloads") -> Dict[str, Any]:
+def download_media_from_message(message_id: str, thread_id: str, download_path: str = "") -> Dict[str, Any]:
     """Download media from a specific Instagram direct message and get the local file path.
     Args:
         message_id: The ID of the message containing the media
         thread_id: The ID of the thread containing the message
-        download_path: Directory to save the downloaded file (default: ./downloads)
+        download_path: Directory to save the downloaded file (default: ~/.instagram_dm_mcp/downloads)
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
     try:
-        _ensure_download_directory(download_path)
+        download_path = _resolve_download_directory(download_path)
         target_message = _find_message_in_thread(thread_id, message_id)
         if not target_message:
             return {
@@ -1380,7 +1419,7 @@ def download_media_from_message(message_id: str, thread_id: str, download_path: 
             "success": True,
             "message": "Media downloaded successfully",
             "file_path": file_path,
-            "media_type": "photo" if target_message.media.media_type == 1 else "video",
+            "media_type": _direct_media_kind(target_message.media),
             "message_id": message_id,
             "thread_id": thread_id
         }
@@ -1393,17 +1432,17 @@ def download_media_from_message(message_id: str, thread_id: str, download_path: 
 
 @mcp.tool()
 @rate_limited("lookup")
-def download_shared_post_from_message(message_id: str, thread_id: str, download_path: str = "./downloads") -> Dict[str, Any]:
+def download_shared_post_from_message(message_id: str, thread_id: str, download_path: str = "") -> Dict[str, Any]:
     """Download media from a shared post/reel/clip in a DM message and get the local file path.
     Args:
         message_id: The ID of the message containing the shared post/reel/clip
         thread_id: The ID of the thread containing the message
-        download_path: Directory to save the downloaded file (default: ./downloads)
+        download_path: Directory to save the downloaded file (default: ~/.instagram_dm_mcp/downloads)
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
     try:
-        _ensure_download_directory(download_path)
+        download_path = _resolve_download_directory(download_path)
         target_message = _find_message_in_thread(thread_id, message_id)
         if not target_message:
             return {"success": False, "message": f"Message {message_id} not found in thread {thread_id}"}
