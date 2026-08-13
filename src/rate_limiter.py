@@ -49,6 +49,11 @@ _STATE_PATH = Path.home() / ".instagram-mcp-rate-limits.json"
 _LOCK_PATH = _STATE_PATH.with_name(_STATE_PATH.name + ".lock")
 _THREAD_LOCK = threading.Lock()
 
+# Mirror of the state, and whether the file is currently writable. Together they
+# keep the caps enforced when the volume is not writable, instead of failing open.
+_MEMORY_STATE: Dict[str, List[float]] = {}
+_PERSISTENCE_OK = True
+
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "dm_send": {"per_minute": 2,  "per_hour": 20,  "per_day": 80,   "jitter": (1.5, 4.0)},
     "like":    {"per_minute": 6,  "per_hour": 30,  "per_day": 200,  "jitter": (0.5, 2.0)},
@@ -115,16 +120,33 @@ def _state_lock() -> Iterator[None]:
             yield
             return
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                # Some filesystems (certain NFS mounts) refuse locks. Degrade to
+                # the in-process lock rather than failing the caller's tool call:
+                # one process still serialises correctly, which is the common case.
+                logger.warning(
+                    "Could not take the rate-limit file lock (%s); serialising within "
+                    "this process only.", exc
+                )
             yield
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
             finally:
                 os.close(fd)
 
 
 def _load_state() -> Dict[str, List[float]]:
+    if not _PERSISTENCE_OK:
+        # The file is unwritable, so it is stale by definition. Reading it would
+        # hand back budget that was already spent, letting every call past the
+        # cap — the module would look like it was working while enforcing
+        # nothing. The in-memory copy is authoritative until writes recover.
+        return {k: list(v) for k, v in _MEMORY_STATE.items()}
     if not _STATE_PATH.exists():
         return {}
     try:
@@ -135,20 +157,39 @@ def _load_state() -> Dict[str, List[float]]:
         return {}
 
 
-def _save_state(state: Dict[str, List[float]]) -> None:
-    # Write-then-rename: a crash partway through a plain write would leave
-    # unparseable JSON, and _load_state treats that as "start fresh" — silently
-    # handing back a full day's budget. os.replace is atomic on POSIX.
+def _save_state(state: Dict[str, List[float]]) -> bool:
+    """Persist the reservation. Returns whether it reached disk.
+
+    Write-then-rename: a crash partway through a plain write would leave
+    unparseable JSON, and _load_state treats that as "start fresh" — silently
+    handing back a full day's budget. os.replace is atomic on POSIX.
+
+    The in-memory mirror is kept current either way, so that a write failure
+    downgrades this from "limits enforced across restarts" to "limits enforced
+    for the life of this process" rather than to no limits at all.
+    """
+    global _PERSISTENCE_OK
+    _MEMORY_STATE.clear()
+    _MEMORY_STATE.update({k: list(v) for k, v in state.items()})
+
     tmp = _STATE_PATH.with_name(f"{_STATE_PATH.name}.{os.getpid()}.tmp")
     try:
         tmp.write_text(json.dumps(state))
         os.replace(tmp, _STATE_PATH)
+        _PERSISTENCE_OK = True
+        return True
     except Exception as exc:
-        logger.warning("Failed to persist rate-limit state: %s", exc)
+        if _PERSISTENCE_OK:  # log the transition once, not on every call
+            logger.error(
+                "Cannot persist rate-limit state (%s). Still enforcing limits from "
+                "memory, but the budget will reset on restart — fix the volume.", exc
+            )
+        _PERSISTENCE_OK = False
         try:
             tmp.unlink()
         except OSError:
             pass
+        return False
 
 
 def _prune(timestamps: List[float], now: float, window_s: int) -> List[float]:

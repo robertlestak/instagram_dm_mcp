@@ -4,6 +4,7 @@ from fastmcp.server.middleware import Middleware
 from instagrapi import Client
 from instagrapi.exceptions import BadPassword, ChallengeRequired, TwoFactorRequired
 import argparse
+import sys
 from typing import Optional, List, Dict, Any
 import json
 import os
@@ -146,10 +147,27 @@ def _clear_block() -> None:
         logger.warning(f"Could not clear {AUTH.block_file}: {e}")
 
 
-def _save_session() -> None:
-    if AUTH.session_file:
+def _save_session() -> bool:
+    """Persist the session. Returns whether it actually reached disk.
+
+    Persistence failing must never stop the server from serving: the sign-in
+    itself succeeded, and the whole point of this module is that the process
+    stays up and explains itself instead of exiting into a restart loop. An
+    unwritable volume is exactly the case that used to kill startup here.
+    """
+    if not AUTH.session_file:
+        return False
+    try:
         client.dump_settings(AUTH.session_file)
         logger.info(f"Session saved to {AUTH.session_file}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            f"Signed in, but could not save the session to {AUTH.session_file} ({e}). "
+            f"Serving on the in-memory session; a restart will have to sign in again, "
+            f"so make the volume writable."
+        )
+        return False
 
 
 def _attempt_login(verification_code: str = "") -> Dict[str, Any]:
@@ -228,9 +246,13 @@ def _attempt_login(verification_code: str = "") -> Dict[str, Any]:
         AUTH.set("needs_login", f"{type(e).__name__}: {e}")
         return {"success": False, "state": AUTH.state, "message": f"Sign-in failed: {e}"}
 
-    _save_session()
+    persisted = _save_session()
     _clear_block()
-    AUTH.set("authenticated", f"Signed in as @{AUTH.username}.")
+    AUTH.set(
+        "authenticated",
+        f"Signed in as @{AUTH.username}."
+        + ("" if persisted else " The session could not be saved, so a restart will sign in again."),
+    )
     logger.info(f"Signed in as @{AUTH.username}")
     return {"success": True, "state": AUTH.state, "message": AUTH.detail}
 
@@ -284,9 +306,13 @@ def _adopt_sessionid() -> bool:
         except Exception:  # noqa: BLE001
             pass
 
-    _save_session()
+    persisted = _save_session()
     _clear_block()
-    AUTH.set("authenticated", f"Signed in as @{username} from a supplied browser session.")
+    AUTH.set(
+        "authenticated",
+        f"Signed in as @{username} from a supplied browser session."
+        + ("" if persisted else " The session could not be saved, so a restart will sign in again."),
+    )
     logger.info(f"Signed in as @{username} via INSTAGRAM_SESSIONID")
     return True
 
@@ -1422,7 +1448,7 @@ if __name__ == "__main__":
     try:
         _default_port = int(_env_port) if _env_port else 8000
     except ValueError:
-        print(f"Error: MCP_PORT is not a number ({_env_port!r})")
+        print(f"Error: MCP_PORT is not a number ({_env_port!r})", file=sys.stderr)
         exit(1)
 
     parser.add_argument(
@@ -1525,5 +1551,5 @@ if __name__ == "__main__":
             )
     except Exception as e:
         logger.error(f"MCP server stopped with an error: {e}")
-        print(f"Error: MCP server stopped - {e}")
+        print(f"Error: MCP server stopped - {e}", file=sys.stderr)
         exit(1)
