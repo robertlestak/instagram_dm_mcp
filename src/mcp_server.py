@@ -802,8 +802,27 @@ def list_chats(
         }
 
     def filter_fields(thread, fields):
+        """Select `fields`, preferring the summary's names over the raw thread.
+
+        The summary renames as it flattens — `thread_id` is the thread's `id`
+        key — so a plain `t.get(field)` answered "thread_id" with None even
+        though that is the name list_chats advertises everywhere else. Look in
+        the summary first, fall back to the raw thread for anything else it
+        exposes, and collect names that match neither so the caller hears about
+        a typo instead of receiving a null for it.
+        """
         t = thread if isinstance(thread, dict) else thread.dict()
-        return {field: t.get(field) for field in fields}
+        summary = thread_summary(thread)
+        selected: Dict[str, Any] = {}
+        unknown: List[str] = []
+        for field in fields:
+            if field in summary:
+                selected[field] = summary[field]
+            elif field in t:
+                selected[field] = t[field]
+            else:
+                unknown.append(field)
+        return selected, unknown, set(summary) | set(t)
 
     try:
         # Keyword arguments, not positional: direct_threads() takes
@@ -819,7 +838,18 @@ def list_chats(
         if full:
             return {"success": True, "threads": [t.dict() if hasattr(t, 'dict') else str(t) for t in threads]}
         elif fields:
-            return {"success": True, "threads": [filter_fields(t, fields) for t in threads]}
+            results = [filter_fields(t, fields) for t in threads]
+            unknown = sorted({f for _, u, _ in results for f in u})
+            if unknown:
+                available = sorted(set().union(*(a for _, _, a in results)))
+                return {
+                    "success": False,
+                    "message": (
+                        f"Unknown field(s): {', '.join(unknown)}. "
+                        f"Available fields: {', '.join(available)}."
+                    ),
+                }
+            return {"success": True, "threads": [s for s, _, _ in results]}
         else:
             return {"success": True, "threads": [thread_summary(t) for t in threads]}
     except Exception as e:
