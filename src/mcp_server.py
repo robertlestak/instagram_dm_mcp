@@ -3,7 +3,15 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware
 from instagrapi import Client
-from instagrapi.exceptions import BadPassword, ChallengeRequired, TwoFactorRequired
+from instagrapi.exceptions import (
+    AccountSuspended,
+    BadPassword,
+    ChallengeRequired,
+    ClientLoginRequired,
+    LoginRequired,
+    SentryBlock,
+    TwoFactorRequired,
+)
 import argparse
 import ipaddress
 import sys
@@ -17,14 +25,17 @@ from dotenv import load_dotenv
 import logging
 from pathlib import Path
 
+from logger import configure_logging
 from rate_limiter import rate_limited
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Set up logger
+# Set up logger. Without configure_logging() this logger has no handler, so
+# everything it records below WARNING is discarded — including the whole
+# sign-in trail.
+configure_logging()
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 INSTRUCTIONS = """
 This server is used to send messages to a user on Instagram.
@@ -105,6 +116,20 @@ mcp = FastMCP(
 )
 
 UNRECOVERABLE_LOGIN_ERRORS = (TwoFactorRequired, BadPassword, ChallengeRequired)
+
+# Errors that prove a saved session is no longer usable, as opposed to a probe
+# that merely failed to answer. Instagram returns 467 on the user-info endpoint
+# for sessions that still authorize every other call, so "the probe raised" and
+# "the session is dead" are genuinely different facts and only these say the
+# latter. Treating the difference as one thing is what let a dead session sit
+# reported as signed in until the first real tool call failed.
+DEAD_SESSION_ERRORS = (
+    LoginRequired,
+    ClientLoginRequired,
+    ChallengeRequired,
+    AccountSuspended,
+    SentryBlock,
+)
 
 
 def _is_loopback(host: str) -> bool:
@@ -389,6 +414,14 @@ def _load_session() -> bool:
         AUTH.set("authenticated", f"Signed in as @{info.username} from a saved session.")
         logger.info(f"Session valid for @{info.username}")
         return True
+    except DEAD_SESSION_ERRORS as e:
+        # Instagram has said outright that this session is finished. Report the
+        # failure rather than adopting it, so bootstrap_auth falls through to a
+        # real sign-in. The device identifiers loaded above stay on the client,
+        # so that sign-in still presents the fingerprint Instagram already
+        # knows — which is what a challenge asks for on retry.
+        logger.warning(f"Saved session is no longer valid ({type(e).__name__}: {e}).")
+        return False
     except Exception as e:  # noqa: BLE001
         # Instagram's mobile API frequently returns 467 on the user-info
         # endpoint for browser-derived sessions that still authorize other
