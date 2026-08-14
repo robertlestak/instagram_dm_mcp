@@ -806,7 +806,16 @@ def list_chats(
         return {field: t.get(field) for field in fields}
 
     try:
-        threads = client.direct_threads(amount, selected_filter, thread_message_limit)
+        # Keyword arguments, not positional: direct_threads() takes
+        # (amount, selected_filter, box, thread_message_limit), so passing the
+        # message limit third handed it to `box` and every call carrying one
+        # failed with `Unsupported box="<limit>"`. Naming them also keeps this
+        # working if instagrapi reorders the signature again.
+        threads = client.direct_threads(
+            amount=amount,
+            selected_filter=selected_filter,
+            thread_message_limit=thread_message_limit,
+        )
         if full:
             return {"success": True, "threads": [t.dict() if hasattr(t, 'dict') else str(t) for t in threads]}
         elif fields:
