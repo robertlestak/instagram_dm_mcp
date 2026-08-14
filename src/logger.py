@@ -26,6 +26,26 @@ _OWN_LOGGERS = ("__main__", "mcp_server", "rate_limiter", "logger", "auth")
 _HANDLER_MARK = "_instagram_dm_mcp_handler"
 
 
+def _resolve_level(name: str) -> int:
+    """Map a LOG_LEVEL string to a level number, falling back to INFO.
+
+    `setLevel` raises on anything it does not recognise, and this module is
+    configured at import, so a typo'd or empty LOG_LEVEL would take the whole
+    server down before it ever served a request. Too little logging is a far
+    better failure than no server. `getLevelName` accepts the same names
+    `setLevel` does — including the WARN and FATAL aliases — and hands back a
+    string rather than an int for the ones it does not know.
+    """
+    level = logging.getLevelName(name)
+    if isinstance(level, int):
+        return level
+    print(
+        f"Warning: ignoring unknown LOG_LEVEL {name!r}, using INFO",
+        file=sys.stderr,
+    )
+    return logging.INFO
+
+
 def configure_logging() -> None:
     """Attach a formatted stderr handler to the root logger, at most once."""
     root = logging.getLogger()
@@ -40,9 +60,10 @@ def configure_logging() -> None:
         setattr(handler, _HANDLER_MARK, True)
         root.addHandler(handler)
 
+    level = _resolve_level(_LEVEL)
     root.setLevel(logging.WARNING)
     for name in _OWN_LOGGERS:
-        logging.getLogger(name).setLevel(_LEVEL)
+        logging.getLogger(name).setLevel(level)
 
 
 configure_logging()
